@@ -544,21 +544,29 @@ So every message contains: the message itself, its MITT record, the transaction 
 
 ### 8.3 Continuation message (within existing transaction)
 
-**Source:** The previously received message in this transaction.
+**Source:** The previously received message in this transaction — with one carve-out for role transfers.
 
 **Algorithm:**
 1. Software identifies the available next MITTs (see [§9](#9-the-mitt-graph-message-sequencing)).
 2. User selects a MITT and fills in the data fields.
-3. Software extracts from the **previous message** (not the PSB):
+3. Software extracts a **raw snapshot** from the **previous message** (not the PSB):
    - The TransactionTemplate — **verbatim, unchanged**. The transaction number, initiator, executor, project are frozen from the first message.
    - Both PersonInRole subtrees — carried forward.
    - The ProjectTypeInstance — carried forward.
-4. Software creates a new MessageTemplate and MessageInTransactionTemplate.
-5. Data fields may be carried forward, cleared, or made editable per [ElementCondition rules](#10-element-conditions-field-editability-rules).
+   - All MessageInTransactionTemplate elements — carried forward.
+4. **Role transfer patching** (the one exception to "copy verbatim"):
+   - If a **permanent successor** has been assigned since the previous message: the original PersonInRole in the snapshot gains a `<successor>` child pointing to the new PersonInRole. The successor's full subtree (person, organisation, role, complex elements) is walked from the **current PSB** and added to the message. Multi-hop chains (B→C→D) are followed transitively.
+   - If the sender is a **temporary substitute** acting on behalf of a PersonInRole in the snapshot: the substitute's PersonInRole subtree is added from the **current PSB**. The original PersonInRole is not modified.
+   - **Crucially, the transaction's `<initiator>` and `<executor>` references are never changed.** Per Bijlage 7 §1.8: *"C is included only as the successor of B"* — the new person appears in the message via the successor/substituting mechanism, but the transaction's pinned role assignments ensure traceability across the full chain.
+   - If no role transfers have occurred, this step is a no-op (fast path).
+5. Software creates a new MessageTemplate and MessageInTransactionTemplate.
+6. Data fields may be carried forward, cleared, or made editable per [ElementCondition rules](#10-element-conditions-field-editability-rules).
 
 > **Critical rule (Bijlage 8 §3.4 stap 1):** *"Het VISI bericht wordt opgemaakt door het versturende IS op basis van het ontvangen bericht (in geval van een nieuwe transactie wordt de informatie uit het projectspecifieke bericht gehaald)."* — The message is composed based on the received message; only for a new transaction is the PSB used.
 
-This means a running transaction is **frozen on its original framework + PSB state**. If the PSB is updated mid-transaction, ongoing transactions are not affected — they carry forward their embedded context from message to message.
+This means a running transaction is **mostly frozen** on its original framework + PSB state. The continuation message copies embedded context from message to message. The **sole exception** is role transfers: successor and substituting PIR subtrees are sourced from the **current PSB** because the replacement may not have existed when the previous message was sent. This is not a PSB "refresh" — only the narrow subtrees needed for the transferred roles are pulled in; everything else remains frozen.
+
+See [§12 Role Transfer](#12-role-transfer-successor-and-substituting) for the full mechanism.
 
 ### 8.4 XML serialization
 
@@ -833,12 +841,29 @@ Rules:
 
 ### Implementation in continuation messages
 
-When building a continuation message where role transfer has occurred:
-1. Copy the TransactionTemplate verbatim from the previous message.
-2. Check if the current sender's PersonInRole has a successor or is substituting.
-3. If successor: add `<successor><PersonInRoleRef idref="..."/></successor>` to the original PIR. Add the successor's full subtree (PersonInRole + person + org + role) to the message root.
-4. If substituting: add the delegate's PersonInRole subtree to the message root.
-5. Never modify the `<initiator>` or `<executor>` references on the TransactionTemplate.
+Role transfer patching is a **post-processing step** applied after the raw snapshot is extracted from the previous message but before the final message XML is built. The normative basis is Bijlage 7 §1.8:
+
+> *"When 'A' starts transaction T1 and sends a message to 'B', the VISI XML message contains 'A' as initiator and 'B' as executor. When 'C' becomes the successor of 'B' and replies on behalf of 'B', the VISI XML message still contains 'A' as the initiator and 'B' as the executor. 'C' is included only as the successor of 'B'."*
+
+**Algorithm:**
+
+1. Extract the raw snapshot from the previous message (verbatim copy, per §8.3).
+2. Load the current role transfer state: which PIRs have successors (from project configuration), and whether the current sender is substituting for someone.
+3. **Successor patching:** For each PIR in the snapshot that has a successor in the current state:
+   - Clone the PIR element.
+   - If it does not already have a `<successor>` child: insert `<successor><PersonInRoleRef idref="C"/></successor>` **before** `<contactPerson>` (EXPRESS field order).
+   - Queue the successor PIR id for closure walking.
+   - If the PIR already has a `<successor>` child (from a prior message): follow the chain — if C has a successor D in the state, queue D.
+4. **Substituting inclusion:** If the current sender's PIR is not in the snapshot but is substituting for a PIR that is: queue the sender's PIR for closure walking.
+5. **BFS closure walk** from the current PSB: for each queued PIR id, walk outward to collect the full subtree (contactPerson, organisation with its contactPerson and complex elements, role). Deduplicate against elements already in the snapshot.
+6. Assemble the patched snapshot: original elements + patched PIRs + newly walked elements.
+7. Build the message from the patched snapshot. The `<initiator>` and `<executor>` references on the TransactionTemplate remain **pinned** to the original PIR ids.
+
+**Key properties:**
+- **Idempotent:** If a snapshot already has a `<successor>` child on a PIR, it is never re-patched.
+- **No mutation:** The input snapshot is never modified; all PIRs are cloned.
+- **Narrow scope:** Only role-transfer-related PIR subtrees are sourced from the current PSB. All other context (transaction, project, original organisations/persons) remains frozen from the previous message.
+- **Multi-hop:** Successor chains of arbitrary depth (B→C→D→...) are followed transitively via BFS.
 
 ---
 
