@@ -28,6 +28,7 @@ For the "why" behind VISI's design: see Appendix B.
 **Appendix A** — [DEMO Transaction Pattern](#appendix-a-demo-transaction-pattern)
 **Appendix B** — [Design Rationale: Non-Obvious Decisions](#appendix-b-design-rationale-non-obvious-decisions)
 **Appendix C** — [Reference Documents](#appendix-c-reference-documents)
+**Appendix D** — [Verified Implementation Rules (from Golden-Sample Testing)](#appendix-d-verified-implementation-rules-from-golden-sample-testing)
 
 ---
 
@@ -456,6 +457,25 @@ The promoted XSD uses `xs:sequence` for child elements of each entity type, mean
 
 This is easy to miss — building elements in the wrong order produces a message that looks correct but fails XSD validation.
 
+### Required metadata fields (version-dependent)
+
+The promoted XSD's `xs:sequence` for each entity type includes metadata fields (`identification`, `dateSend`, `dateRead`, `state`, `dateLaMu`, `userLaMu`). Their optionality differs by version:
+
+| Field | v1.3 XSD | v1.6+ XSD |
+|-------|----------|-----------|
+| `identification` | required | required |
+| `dateSend` | required | required on messages, optional on MITTs |
+| `dateRead` | required | optional (`minOccurs="0"`) |
+| `state` | required | optional |
+| `dateLaMu` | required | optional |
+| `userLaMu` | required | optional |
+
+An implementation that composes messages must emit all required metadata fields with valid typed values (e.g., `xsd:dateTime` fields cannot be empty). The safest approach: read the promoted XSD to determine which fields are required, and emit defaults for any required field not explicitly set.
+
+### v1.3 XSD generator quirk
+
+The v1.3 Promotor DLL (Peter Bonsma's "EXP2XSD") generates XSDs with an invalid namespace declaration: `xmlns:="..."` (empty-string prefix). This is not valid XML — standard parsers reject it. The colon-prefix convention (`:TypeName`) is used throughout for `ref`, `type`, and `base` attributes. Implementations that ingest v1.3 promoted XSDs must sanitize this before parsing: replace `xmlns:=` with a proper prefix binding (e.g., `xmlns:tns=`) and update all `:TypeName` references accordingly.
+
 ### XML ID validity
 
 The `id` attribute on all elements uses `xs:ID` type, which requires the value to start with a letter or underscore (not a digit). If your instance IDs are UUIDs or numeric, you must prefix them (e.g., `id-12345` or `_12345`) to produce valid XML.
@@ -523,7 +543,7 @@ MessageTemplate
 
 So every message contains: the message itself, its MITT record, the transaction (with both PersonInRoles and their full organisation/person/role subtrees), and the project configuration.
 
-> **Implementation note:** The transitive closure also includes **all MessageInTransactionTemplate elements** from the source document (PSB or previous message). These are carried forward even though they are not direct children of the MessageTemplate — they must appear at root level in the serialized XML.
+> **Implementation note:** Each message carries exactly **one** MessageInTransactionTemplate — the MITT for the current message step. The builder creates a fresh MITT instance; previous MITTs from the source document are NOT carried forward. This is mandated by the EXPRESS schema (_5.exp): `MessageTemplate.messageInTransaction` is a singular reference, not a set. The golden samples confirm: every message in the TopKoks corpus has exactly 1 MITT element at root level.
 
 ### 8.2 First message in a transaction
 
@@ -772,19 +792,46 @@ ElementConditions control whether data fields can be modified across consecutive
 | **FIXED** | Field value is locked — must carry forward from the previous message unchanged |
 | **EMPTY** | Field is cleared; sender must provide a new value |
 
-### Scope and priority
+### Scope fields
 
-An ElementCondition can be scoped to:
-- A **ComplexElement + SimpleElement** combination (most specific)
-- A **ComplexElement** alone
-- A **SimpleElement** alone
-- A **MITT** alone (least specific)
+An ElementCondition has three optional scope fields that determine what it targets:
 
-Priority (highest wins): ComplexElement + SimpleElement > ComplexElement > SimpleElement > MITT.
+```
+ENTITY ElementCondition;
+  condition            : STRING;                              -- FREE | FIXED | EMPTY
+  complexElements      : OPTIONAL SET [0:2] OF ComplexElementType;  -- parent + child CE
+  simpleElement        : OPTIONAL SimpleElementType;                -- specific field
+  messageInTransaction : OPTIONAL MessageInTransactionType;         -- specific MITT step
+END_ENTITY;
+```
+
+The `complexElements` field can contain 0, 1, or 2 ComplexElementType refs. When 2 are present, the first is the parent CE and the second is the child CE (establishing a context path). Framework XML uses both `<complexElements>` (plural) and `<complexElement>` (singular) for this field — implementations must handle both naming patterns.
+
+### Priority resolution (specificity scoring)
+
+When multiple ElementConditions match a field at a given MITT step, the most specific one wins. Each scope field contributes to a score:
+
+| Scope field | Score contribution |
+|-------------|-------------------|
+| complexElements | +2 per CE ref (max +4 for 2 CEs) |
+| simpleElement | +2 |
+| messageInTransaction | +1 |
+
+Maximum possible score: 7 (2 CEs + SE + MITT). The condition with the highest score wins. Ties: undefined by the spec (avoid in framework design).
+
+**Examples from TopKoks Scenario 10:**
+- `CE(parent) + CE(child) + SE + MITT` → score 7, most specific
+- `CE(parent) + CE(child) + SE` → score 6
+- `MITT only` → score 1, broadest
+- No scope fields → score 0, global default
 
 ### Default behavior
 
-Without explicit conditions, the default for continuation messages is: values carry forward from the previous message (implicit FIXED behavior for fields that existed in the previous message).
+Without explicit conditions, the default for continuation messages is FREE — values carry forward from the previous message and are editable. The spec does not define an implicit FIXED behavior; if a framework author wants fields locked, they must declare explicit ElementConditions.
+
+### Invalid conditions
+
+The certification test (Scenario 10, `ElementCondition7vanScenario10`) includes an intentionally invalid condition where the parent/child CE order is swapped — the referenced CE hierarchy doesn't exist in the framework. Implementations should detect this and skip the condition (log a warning, do not apply).
 
 ---
 
@@ -831,13 +878,22 @@ Rules:
 
 ### Substituting (temporary delegation)
 
-When a person acts on behalf of another, the delegate's PersonInRole has a `<substituting>` child pointing to the principal.
+When a person acts on behalf of another, the delegate's PersonInRole has a `<substituting>` child pointing to the principal **in the PSB**. The relationship direction is: delegate → principal ("I act on behalf of X").
 
 Rules:
 - Multiple delegates can act for the same principal.
 - The principal retains authority — delegation can be revoked.
-- In the message body, the delegate's PersonInRole subtree is added alongside the original.
 - The TransactionTemplate references are unchanged.
+
+**Critical: the `<substituting>` element is stripped from PIR elements in messages.** The PSB's `<substituting>` child is administrative metadata — it records who delegated to whom. In messages, PIR elements carry only `contactPerson`, `organisation`, `role`, and optionally `successor`. The golden samples confirm this: PIR elements in messages never have a `<substituting>` child, even when the corresponding PSB entry does.
+
+This differs from `successor`, where the `<successor>` element IS kept in messages and the successor PIR IS included as a root entity. The asymmetry:
+
+| | `successor` (forward) | `substituting` (backward) |
+|---|---|---|
+| Direction | "PiR005 replaces me" | "I act on behalf of PiR003" |
+| Keep ref element on PIR in message? | **Yes** | **No — strip it** |
+| Include target PIR in message? | **Yes** (follow the chain) | **No** |
 
 ### Implementation in continuation messages
 
@@ -1042,6 +1098,8 @@ Version 1.7 adds XAdES-B-LT digital signatures:
 
 | Feature | v1.3 | v1.4 | v1.6 | v1.7 |
 |---------|------|------|------|------|
+| Framework root element | `ISO29481_Part_2A` | `visiXML_VISI_Systematics` | `visiXML_VISI_Systematics` | `visiXML_VISI_Systematics` |
+| Message root element | `ISO29481_Part_2B` | `visiXML_MessageSchema` | `visiXML_MessageSchema` | `visiXML_MessageSchema` |
 | Namespace | `20110819` | `20140331` | `20160331` | `20220930` |
 | Max attachment size | 120 MB | 120 MB | 10 GB | 10 GB |
 | MITTCondition | — | Added | Unchanged | Unchanged |
@@ -1107,6 +1165,8 @@ Because transactions are frozen on their original state. Bijlage 8 §3.4 stap 1 
 - The conversation carries itself — once started, it's self-sustaining.
 - Only **new** transactions use the updated PSB.
 
+**The one exception:** When a permanent successor is assigned (PSB updated with a `<successor>` on an existing PIR), the successor link and the new PIR's subtree are patched in from the current PSB. This is the narrow carve-out from Bijlage 7 §1.8. The `<substituting>` relationship is NOT an exception — it is PSB-level metadata that is stripped from messages entirely (see §12 and Appendix D.2).
+
 ### Why is the promoted XSD a choice with unbounded maxOccurs?
 
 The `<xs:choice maxOccurs="unbounded">` at the root is the XML serialization of the EXPRESS embedded-object model. In EXPRESS, objects are embedded (owned by their parent). In XML, this is represented by floating them to the root level and using `<XRef idref="..."/>` references. The XSD must allow any number of entities in any order at root level because different messages embed different numbers of entities.
@@ -1162,3 +1222,55 @@ Schema-technically, there is no "PSB type" versus "message type." Both are `visi
 | `Notes_Timo/message_composition.md` | Message self-containment, PSB slicing, URL duplication rationale |
 | `Notes_Timo/central_server.md` | SOAP Central Server architecture and reliability |
 | `Notes_Timo/version_overview_and_subTransactions.md` | Version differences, MITT graph, subTransaction removal |
+
+---
+
+## Appendix D: Verified Implementation Rules (from Golden-Sample Testing)
+
+The following rules were verified by composing all 16 messages in the TopKoks v1.3 reference corpus (`testproject/Top Koks testproject/`) and comparing structural fingerprints against the golden samples authored by the VISI spec writers. These are implementation details that the normative spec either doesn't state explicitly or buries in dense prose.
+
+### D.1 Exactly one MITT per message
+
+Every message carries exactly one MessageInTransactionTemplate element at root level — the MITT for the current message step. Previous MITTs from earlier messages in the transaction are NOT carried forward. The builder creates a fresh MITT instance each time.
+
+**Normative basis:** EXPRESS _5.exp defines `MessageTemplate.messageInTransaction` as a singular reference (not `SET`). All 16 golden samples confirm: exactly 1 MITT element per message.
+
+### D.2 `<substituting>` is stripped from PIR elements
+
+When a PersonInRole in the PSB has a `<substituting>` child (recording that this person is a delegate), that element is **removed** before the PIR is included in a message. The substituted PIR (the principal) is NOT included as a root entity.
+
+By contrast, `<successor>` children ARE kept, and the successor PIR IS included with its full subtree (contactPerson, organisation, role).
+
+**Verified:** Golden message 6 has PiR004 as executor. The PSB's PiR004 has `<substituting><PersonInRoleRef idref="PiR003"/>`. The golden message's PiR004 has only `contactPerson`, `organisation`, `role` — no `<substituting>` child, no PiR003 entity.
+
+### D.3 Successor chains are followed transitively
+
+When a PIR has a `<successor>` reference, the successor PIR and its full dependency tree (person, organisation, role) are included in the message. Multi-hop chains (A→B→C) are followed via BFS.
+
+**Verified:** Golden message 7 has PiR004 with `<successor>` → PiR005. PiR005 is present as a root entity with its contactPerson (JanToet), organisation, and role.
+
+### D.4 PSB changes affect only role-transfer fields
+
+Continuation messages copy their PSB entities verbatim from the previous message. The sole exception is role transfers: when the current PSB has a `<successor>` on a PIR that the previous message didn't, the successor link and the new PIR subtree are patched in from the current PSB. Everything else (transaction, project, organisations, persons) remains frozen.
+
+**Verified:** The TopKoks corpus switches PSBs between messages 6 and 7 (PiR005 added as successor of PiR004). Messages 1-6 carry the early PSB's entities unchanged. Message 7 patches in PiR005 from the new PSB but retains all other entities from message 6.
+
+### D.5 Transaction element is identical across all messages in a chain
+
+The `<t1_OpnameBestelling>` element (or equivalent) is byte-identical across all messages in the same transaction instance. The initiator/executor PIR refs, project ref, and all metadata fields are frozen from the first message.
+
+**Verified:** MD5 hash of the transaction element is identical across all 11 messages in `transactie001`.
+
+### D.6 Confirmation envelope format is v1.6 for all versions
+
+The parseMessageConfirmation SOAP envelope uses the v1.6 format (Bijlage 8 §3.5) universally: UniqueID in the SOAP Header, ERRORS directly in the Body. There is no normatively specified v1.7 wrapper format — the `<parseMessageConfirmation>` wrapper seen in some implementations is an inference from the XAdES signing requirement, not a spec mandate. XAdES signing is not a certification requirement in either v1.7 or v1.8.
+
+### D.7 Golden sample errata
+
+The reference corpus has three known errors documented in `testproject/Top Koks testproject/ERRATA.md`:
+
+1. **XSD (`10.xsd`)**: Invalid `xmlns:=` namespace prefix (EXP2XSD generator quirk). Fixed to `xmlns:tns=`.
+2. **Message 4 (`vierde_bericht.xml`)**: MITT element named `BerichtInTransactie15` but referenced as `BerichtInTransactie5Ref`. Fixed to `BerichtInTransactie5`.
+3. **Late PSB**: Used undeclared element names `ceWillekeurig`/`ceWillekeurig2` instead of `ceSOAP`/`ceOrganisatie`. Fixed to match the framework.
+
+These should be raised with the VISI standards commission (DigiGO/nl-digigo).
