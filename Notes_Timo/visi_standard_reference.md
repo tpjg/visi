@@ -1274,3 +1274,271 @@ The reference corpus has three known errors documented in `testproject/Top Koks 
 3. **Late PSB**: Used undeclared element names `ceWillekeurig`/`ceWillekeurig2` instead of `ceSOAP`/`ceOrganisatie`. Fixed to match the framework.
 
 These should be raised with the VISI standards commission (DigiGO/nl-digigo).
+
+
+## Appendix E: Implementer's Cheat Sheet
+
+This appendix distills the non-obvious gotchas that cost real implementation
+time to discover. It complements — does not replace — the descriptive prose
+above. Each item points back to the deeper section where the full mechanism
+lives.
+
+### E.1 The protocol has exactly two legs per message
+
+The wire ACK dance for a *single* `parseMessage` is two legs, not three:
+
+```
+Sender                                    Receiver
+  │                                          │
+  │ ──── HTTP POST parseMessage(Mxx) ───────▶│   Connection #1
+  │◀──── HTTP 200 OK (empty body) ───────────│   Leg 1: transport ACK
+  │                                          │         "I got bytes"
+  │                                          │
+  │                                     [validate XSD +
+  │                                      semantics; possibly
+  │                                      store for a human]
+  │                                          │
+  │◀─── HTTP POST parseMessageConfirmation ──│   Connection #2
+  │     UniqueID echoed,                     │   Leg 2: parse-level ACK
+  │     body=<ERRORS><ERROR CODE="0"/></>    │         "I parsed it (or not,
+  │ ──── HTTP 200 OK ───────────────────────▶│          here are the errors)"
+  │                                          │
+  ═══════════════════════════════════════════════ protocol obligations end here
+```
+
+The receiver's job, per the standard, ends at leg 2. Any subsequent VISI
+message (an acceptance, a promise, a revocation) is a **new two-legged
+exchange** in the reverse direction, initiated whenever the human / business
+actor decides. VISI is a formalised email system: receiving and parsing a
+message is mechanical and bounded; replying is semantic and unbounded in time.
+
+**Implication for implementers:** don't wire the "reply" into the same code
+path as the ACKs. A transaction like T02 (M10→M12→M14→M15) is *four*
+independent two-legged exchanges, not one eight-legged flow. Each leg carries
+its own `UniqueID` for transport correlation; business-level correlation
+between messages uses the `id` attribute plus `initiatingTransactionMessageID`
+(see §E.2).
+
+Full reference: §13.3.
+
+### E.2 `<identification>` is vestigial; the `id` attribute is the key
+
+Every `MessageTemplate`-derived message has both an `id` attribute (XML ID)
+**and** an `<identification>` child element. They are not redundant — they
+have different jobs:
+
+| Field                          | Role                                                  | Canonical value |
+| ------------------------------ | ----------------------------------------------------- | --------------- |
+| root `id` attribute            | Machine-readable unique key; IDREF target             | populated (e.g. `id="bericht003"`) |
+| `<identification>` element     | Human-readable annotation; per spec "for humans a slightly more extensive identification may be useful" | **empty (`<identification />`)** |
+| `initiatingTransactionMessageID` (reply) | Points at the previous message's **`id` attribute** | populated when replying |
+
+Every sample in `docs/visi1.7/Example Implementation.md` and
+`docs/visi1.8/Example Implementation.md` has empty `<identification />`. Do
+not use it for correlation, do not require it to be populated, do not
+populate it in your outbound replies unless your tooling needs human
+annotations.
+
+Full reference: `docs/visi1.7/MessageTemplateElements.md:238-252`;
+`docs/visi1.7/DemoTransactionpattern.md:794-797`.
+
+### E.3 Framework type name ≠ runtime instance shape
+
+A single element name (`Mitt_10`, `T02-`, or any transaction type) has
+**two distinct shapes** depending on where it appears:
+
+| Appears in                                    | Shape                                                                 |
+| --------------------------------------------- | --------------------------------------------------------------------- |
+| Framework XML (`_7.xml`, e.g. `metaraamwerk.xml`) | Type definition: `initiatorToExecutor`, `message`, `previous`, `transaction` (for MITT); `initiator`/`executor` role refs (for Transaction) |
+| Runtime message (`visiXML_MessageSchema` body) | Instance: `identification`, `dateSend`, `dateRead`, … (for MITT); `number`, `name`, `description`, `startDate`, `endDate`, `initiator`/`executor` PIR refs, `project` ref (for Transaction) |
+
+Both shapes share the XSD element name but correspond to different complex
+types. Copy-pasting from a framework file into a runtime message is the
+single most common "I can't figure out why XSD validation is screaming at me"
+mistake. If the XSD complains about unexpected children with framework-ish
+names (`message`, `previous`, `transaction` inside a MITT), this is why.
+
+Full reference: §3 (framework model) vs §4 (instance model).
+
+### E.4 The shipped XSD is a *template* — retarget its namespace
+
+`metaproject/metaraamwerk.xsd` has `targetNamespace="http://www.visi.nl/schemas/20150331"`
+(bare). Runtime messages **must not** use that namespace. They must use the
+namespace declared by the project's ProjectType:
+
+```xml
+<ProjectType id="PRT-Meta-raamwerk">
+  <namespace>http://www.visi.nl/schemas/20150331/metaraamwerk</namespace>
+</ProjectType>
+```
+
+Concrete recipe:
+
+1. Load the shipped template XSD.
+2. Read `<ProjectType><namespace>` from the framework XML (or from the PSB).
+3. Rewrite the XSD's `targetNamespace` attribute (and every `xmlns:visi="…"`
+   binding whose value matched the original) to the project-declared value.
+4. Compile the retargeted XSD into your validator.
+
+Outbound messages must carry the project-declared namespace as their
+`xmlns`; inbound messages using the bare template namespace are a bug in
+the sender.
+
+Full reference: §6; certification rule `docs/visi1.7/CertificationRequest.md:219`.
+
+### E.5 Casing: `cXX-…` (container) vs `CXX-…` (entity)
+
+Inside a `MessageTemplate`-derived element the complex-element **containers**
+are lowercase-first (`c00-Algemeen`, `c04-Start-project`, `c05-Projectgegevens`).
+Each container wraps either an inline `<C00-Algemeen>…</>` (capital C,
+floated entity) or a `<C00-AlgemeenRef idref="…"/>` (capital C + Ref):
+
+```xml
+<M10-VoorstelNieuwVISIproject id="msg-001">
+  <identification />                             <!-- vestigial -->
+  <dateSend>2026-04-14T09:00:00Z</dateSend>
+  <initiatorToExecutor>true</initiatorToExecutor>
+  <messageInTransaction><Mitt_10Ref idref="MITT-001"/></messageInTransaction>
+  <transaction><T02-Ref idref="TX-001"/></transaction>
+  <c05-Projectgegevens>                          <!-- lowercase container -->
+    <C05-ProjectgegevensRef idref="C05-1"/>      <!-- Uppercase ref -->
+  </c05-Projectgegevens>
+</M10-VoorstelNieuwVISIproject>
+```
+
+Getting the casing wrong produces a wall of "invalid child element" XSD
+errors that are otherwise inscrutable.
+
+### E.6 XSD ordering is strict; required elements come in declared order
+
+Every complex type uses `xs:sequence`. `minOccurs="0"` lets you skip an
+optional element but never lets you *reorder* present elements. Example
+pitfall: `T02-` requires `number` **before** `name`; writing `name` first
+fails validation even though both are present.
+
+Full reference: §6.450.
+
+### E.7 What the parseMessageConfirmation body looks like
+
+It does **not** wrap a `parseMessage` or `visiXML_MessageSchema`. `<ERRORS>`
+sits directly under `<SOAP-ENV:Body>`:
+
+```xml
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+  <SOAP-ENV:Header>
+    <SOAPServerURL><sender>…</sender><receiver>…</receiver></SOAPServerURL>
+    <UniqueID><ID>…echo of the parseMessage UniqueID…</ID></UniqueID>
+  </SOAP-ENV:Header>
+  <SOAP-ENV:Body>
+    <ERRORS>
+      <ERROR CODE="0"/>                     <!-- success -->
+      <!-- or, on failure, one or more: -->
+      <!-- <ERROR CODE="1">human-readable reason</ERROR> -->
+    </ERRORS>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>
+```
+
+A receiver distinguishes `parseMessage` from `parseMessageConfirmation` by
+the **root element of the SOAP body**, not by URL path or SOAPAction header.
+
+Full reference: §13.4; Appendix D.6.
+
+### E.8 Attachments: what each transaction expects
+
+| Transaction | AppendixType binding                                           | In practice |
+| ----------- | -------------------------------------------------------------- | ----------- |
+| T01 (framework change) | `APT-NieuwOfGewijzigdRaamwerkOfProjectspecifiekBericht` (mandatory on M01) | framework XML + XSD + PSB as MIME parts |
+| T02 (project initiation) | **none declared in the meta-raamwerk** | observed implementations still ship the new project's framework artefacts on M10 — accept them, log them, don't re-attach them in the M12 reply |
+| Application frameworks | per-framework; check the framework's MessageType definitions  | see `appendixMandatory` flag |
+
+Replies **reference** prior attachments by `<AppendixTemplateRef idref="…"/>`;
+they do not re-float the bytes. The self-containment principle applies to
+entities (orgs, persons, roles, PIRs, transaction), not to attachment bytes.
+
+Full reference: §11.
+
+### E.9 Parse by namespace, not by prefix
+
+The `SOAP-ENV:` prefix used throughout the spec examples is not normative;
+implementations use `soap:`, `s:`, or no prefix. All that matters is the
+namespace binding. Likewise for Content-Type: dispatch on
+`multipart/related` vs `text/xml` vs `application/soap+xml` by top-level
+type, never by exact-string comparison.
+
+### E.10 `dateTime` format tolerance
+
+Both of these are XSD-valid `dateTime`:
+
+- `2008-05-04T00:00:00.0Z`
+- `2026-04-14T09:58:12.0343280+00:00`
+
+Parsers must accept arbitrary fractional-second precision and either `Z` or
+`±HH:MM` offset suffixes. Do not regex-match one format and reject the
+other.
+
+### E.11 Minimum-valid outline of a T02 M10 wire message
+
+For quick diffing against your own builder output. The `visiXML_MessageSchema`
+body must float to its root (in any order, XSD uses `xs:choice`
+`maxOccurs="unbounded"`): one project, one transaction, MITTs referenced by
+the message, two PersonInRoles (initiator + executor), their organisations,
+those organisations' SOAP servers, those organisations' contact persons, the
+role types referenced by the PIRs, each complex-element instance
+(`C00-Algemeen`, `C04-Start-project`, `C05-Projectgegevens`) referenced from
+the message body, and finally the message itself. Skeleton:
+
+```xml
+<visiXML_MessageSchema xmlns="http://www.visi.nl/schemas/20150331/metaraamwerk">
+  <PRT-Meta-raamwerk id="PRJ-META">
+    <name>…</name><description>…</description>
+    <startDate>…</startDate><endDate>…</endDate>
+  </PRT-Meta-raamwerk>
+
+  <standaardOrganisatie id="init-org">…</standaardOrganisatie>
+  <standaardOrganisatie id="exec-org">…</standaardOrganisatie>
+  <CeOrganisatieSOAPServer id="init-soap">…</CeOrganisatieSOAPServer>
+  <CeOrganisatieSOAPServer id="exec-soap">…</CeOrganisatieSOAPServer>
+  <standaardPersoon id="init-pers">…</standaardPersoon>
+  <standaardPersoon id="exec-pers">…</standaardPersoon>
+  <R03-Initiator-VISI-project id="ROL-INIT">…</R03-Initiator-VISI-project>
+  <R04-Executor-VISI-project id="ROL-EXEC">…</R04-Executor-VISI-project>
+  <PersonInRole id="PIR-INIT">…</PersonInRole>
+  <PersonInRole id="PIR-EXEC">…</PersonInRole>
+
+  <T02- id="TX-001">
+    <number>1</number>
+    <name>…</name><description>…</description>
+    <startDate>…</startDate><endDate>…</endDate>
+    <initiator><PersonInRoleRef idref="PIR-INIT"/></initiator>
+    <executor><PersonInRoleRef idref="PIR-EXEC"/></executor>
+    <project><PRT-Meta-raamwerkRef idref="PRJ-META"/></project>
+  </T02->
+
+  <Mitt_10 id="MITT-001"><identification/></Mitt_10>
+
+  <C00-Algemeen id="C00-1"><s00-Algemeen>…</s00-Algemeen></C00-Algemeen>
+  <C04-Start-project id="C04-1">
+    <s04-Moment-start-project>…</s04-Moment-start-project>
+  </C04-Start-project>
+  <C05-Projectgegevens id="C05-1">
+    <s05-Project-ID>…</s05-Project-ID>
+    <s06-Projectnaam>…</s06-Projectnaam>
+  </C05-Projectgegevens>
+
+  <M10-VoorstelNieuwVISIproject id="msg-001">
+    <identification/>
+    <dateSend>…</dateSend>
+    <initiatorToExecutor>true</initiatorToExecutor>
+    <messageInTransaction><Mitt_10Ref idref="MITT-001"/></messageInTransaction>
+    <transaction><T02-Ref idref="TX-001"/></transaction>
+    <c00-Algemeen><C00-AlgemeenRef idref="C00-1"/></c00-Algemeen>
+    <c04-Start-project><C04-Start-projectRef idref="C04-1"/></c04-Start-project>
+    <c05-Projectgegevens><C05-ProjectgegevensRef idref="C05-1"/></c05-Projectgegevens>
+  </M10-VoorstelNieuwVISIproject>
+</visiXML_MessageSchema>
+```
+
+Every required element is present in declared order; every `idref` resolves
+to a floated entity in the same document. Starting from this and deleting
+what doesn't apply is faster than writing from the XSD up.
